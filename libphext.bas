@@ -1,5 +1,6 @@
 ' =====================================================================
-' libphext-bas - BASIC PHEXT (generation 0)
+' libphext-bas - BASIC PHEXT (generation 1: + chunked volumes,
+' incremental parsing across decisions, phReadBase)
 ' A phext engine for the bassy BASIC dialect (Polyworld / Softmax
 ' Cards and Casters policies), mirroring libphext-rs semantics.
 ' The engine works on a genuine phext volume held as TEXT: it
@@ -28,26 +29,60 @@
 ' fresh BotVm per episode): the volume is reloaded every match.
 '
 ' THE STRING LAW (measured on the local runner, stated for
-' consumers): at most 256 string values may be live within one
-' decision - every string-returning host call, concatenation,
-' and slice spends one, and a single decision that overspends
-' dies with "BASIC string count limit exceeded". Strings held in
-' globals survive across decisions; the rest are reclaimed at
-' restart. Consequences: the volume parse runs at setup (its own
-' decision), the in-match observer (section 2) drains the event
-' log under a hard budget of 140 string reads per decision, and
-' phImplode is a setup/harness tool, never an in-match call.
+' consumers): at most 256 string values and 64 KiB of string
+' bytes exist per runtime, 1,024 chars per string. TRANSIENT
+' strings are reclaimed at restart() - bassy.nim's restart
+' gathers the roots and compacts the pool (texts.nim reset) -
+' so each decision starts with the pool minus its roots.
+' ROOTED strings are the per-episode consumable: string
+' globals, string array cells, and every materialized literal
+' persist for the whole episode and shrink every later
+' decision's headroom (probe, EE ~950: 180 literals evaluated
+' at setup plus 100 creations on decision 1 dies with "BASIC
+' string count limit exceeded"; 200 transient slices on each
+' of 11 decisions lives). Consequences: the in-match observer
+' (section 2) drains the event log under a hard budget of
+' string reads per decision (140 by default; phInit lowers it
+' for chunked volumes - see phObsBudget), phImplode is a
+' setup/harness tool, never an in-match call, and a chunked
+' volume spends exactly ONE literal per chunk.
 ' The parse itself spends about one string value per payload
 ' character (MID$+ASC is the dialect's only character access),
 ' so a single-shot setup parse supports roughly 220 payload
 ' characters inside the 256 budget - measured: 223-byte volume
 ' of 32 single-value scrolls parses, 279 bytes fails; 216 bytes
-' of dense 4-value scrolls parses, 247 fails. Keep data volumes
-' small; larger volumes want incremental parsing across
-' decisions (named, not built in generation 0). A single string
+' of dense 4-value scrolls parses, 247 fails. A single string
 ' also caps at 1024 characters, and all string bytes created in
 ' one decision cap at 64 KiB cumulative - create-and-discard
 ' does not reclaim either budget mid-decision (all measured).
+'
+' CHUNKED VOLUMES AND INCREMENTAL PARSING (generation 1). A
+' volume too large for one string rides as CHUNKS: phextwrap
+' --chunked emits a phLoadVolume that sets phChunked = 1 and
+' phChunkN and assigns one literal per chunk into phChunk$()
+' (fixed <= 1000-char slices of the volume - the walker is a
+' resumable byte stream, so a chunk boundary may fall
+' mid-scroll, mid-token, or mid-break-run without changing
+' the parse - and each chunk is one materialized literal,
+' one rooted span per chunk). phInit
+' then runs phParseReset and a first phParseStep inside the
+' setup invocation (budget 170; 48 when phInit is reached
+' lazily at a decision, where selectingClass = 0), and
+' phObserve spends up to 32 more string creations per decision
+' on phParseStep until phPxDone. Walker state (coordinate,
+' chunk, offset, tokenizer) lives in globals, which restart()
+' preserves, so the parse resumes exactly where it stopped.
+' Data-cell scrolls are fed char by char; foreign (prose)
+' scrolls are skipped by INSTR position at zero string cost.
+' Order the volume so the data cell comes first (canonical
+' coordinate order does): parameters land in the setup step.
+' The embeddable ceiling is now set by the rooted budget -
+' chunks + code literals + break strings must leave the
+' observer and the parse step their per-decision headroom;
+' 24 chunks x 1000 chars plus full observer load is
+' probe-verified, and phInit's adaptive phObsBudget
+' (149 - phChunkN, floored at 60, capped at 140) keeps the
+' worst-case decision inside 256 by construction.
 '
 ' COORDINATES AND THE STORE. Phext coordinates are 9D:
 ' (library, shelf, series, collection, volume, book, chapter,
@@ -90,6 +125,10 @@
 ' API (all state in ph-prefixed globals; GOSUB contracts):
 '   phTextInit   build the dimension-break strings
 '   phParseVolume  parse phVol$ (phext text) into the store
+'   phParseReset   zero the incremental-parse walker state
+'   phParseStep    parse a bounded slice of the chunked volume
+'                  (caller sets phParseBudget; state persists
+'                  across decisions in globals)
 '   phImplode    serialize the store's data cell to phOut$
 '   phPack     (phFam, phSeat, phSlot, phPhase) -> phIdx
 '   phUnpack   phIdx -> (phFam, phSeat, phSlot, phPhase)
@@ -104,11 +143,13 @@
 ' code, this library, and ONE volume include providing
 ' phLoadVolume (phextwrap output; this repo also ships an empty
 ' stub for volume-less use). The binding's phInit calls
-' phLoadVolume, then phParseVolume.
+' phLoadVolume, then phParseVolume - or, when the include is
+' a chunked one (phChunked = 1), phParseReset + phParseStep.
 ' =====================================================================
 
 DIM phStore(2047)
 DIM phCoord(8)
+DIM phChunk$(63)
 
 ' ==== SECTION 1: CORE - STORE ====
 
@@ -238,69 +279,96 @@ RETURN
 
 phScrollIn:
 ' One scroll's text (phText$) at the walker's 9D coordinate.
-' Outside the data cell: count and skip. Inside: parse the
-' payload's integer list and store value k at phase0+k.
-IF phCoord(0) <> 1 OR phCoord(1) <> 1 OR phCoord(2) <> 1 OR phCoord(3) <> 1 OR phCoord(4) <> 1 THEN
-  phForeign = phForeign + 1
-  RETURN
-END IF
-phFam = phCoord(6) - 1
-phSeat = phCoord(7) - 1
-phSlot = phCoord(8) - 1
-phPhase0 = phCoord(5) - 1
-IF phFam < 0 OR phFam > 2 OR phSeat < 0 OR phSeat > 7 OR phSlot < 0 OR phSlot > 15 OR phPhase0 < 0 OR phPhase0 > 3 THEN
+' Outside the data cell: count and skip. Inside: capture the
+' projection, feed the payload's characters through the shared
+' tokenizer (phFeedCh), and flush the final token.
+GOSUB phPxGateFromCoord
+IF phPxForeign = 1 THEN
   phForeign = phForeign + 1
   RETURN
 END IF
 phScrolls = phScrolls + 1
-phK = 0
 phTokV = 0
 phTokSgn = 1
 phTokOn = 0
 phTokDig = 0
 phTokBad = 0
+phK = 0
 phI = 1
-WHILE phI <= LEN(phText$) + 1
-  phCh = 32
-  IF phI <= LEN(phText$) THEN phCh = ASC(MID$(phText$, phI, 1))
-  IF phCh = 32 OR phCh = 44 OR phCh = 9 OR phCh = 10 OR phCh = 13 THEN
-    IF phTokOn = 1 THEN
-      IF phTokBad = 1 OR phTokDig = 0 THEN
-        phParseErr = phParseErr + 1
-      ELSE
-        phFam = phCoord(6) - 1
-        phSeat = phCoord(7) - 1
-        phSlot = phCoord(8) - 1
-        phPhase = phPhase0 + phK
-        IF phPhase > 3 THEN
-          phParseErr = phParseErr + 1
-        ELSE
-          phVal = phTokSgn * phTokV
-          GOSUB phReplace
-        END IF
-      END IF
-      phK = phK + 1
-      phTokV = 0
-      phTokSgn = 1
-      phTokOn = 0
-      phTokDig = 0
-      phTokBad = 0
-    END IF
-  ELSE
-    phTokOn = 1
-    IF phCh >= 48 AND phCh <= 57 THEN
-      phTokV = phTokV * 10 + phCh - 48
-      phTokDig = phTokDig + 1
-    ELSE
-      IF phCh = 45 AND phTokDig = 0 AND phTokV = 0 THEN
-        phTokSgn = -1
-      ELSE
-        phTokBad = 1
-      END IF
-    END IF
-  END IF
+WHILE phI <= LEN(phText$)
+  phCh = ASC(MID$(phText$, phI, 1))
+  GOSUB phFeedCh
   phI = phI + 1
 WEND
+phCh = 32
+GOSUB phFeedCh
+RETURN
+
+phPxGateFromCoord:
+' The data-cell test, shared by phScrollIn and the incremental
+' walker: sets phPxForeign, and on a data scroll captures the
+' projection (phPxFam, phPxSeat, phPxSlot, phPxPhase0) from the
+' walker's current coordinate phCoord.
+phPxForeign = 0
+IF phCoord(0) <> 1 OR phCoord(1) <> 1 OR phCoord(2) <> 1 OR phCoord(3) <> 1 OR phCoord(4) <> 1 THEN phPxForeign = 1
+IF phPxForeign = 0 THEN
+  phPxFam = phCoord(6) - 1
+  phPxSeat = phCoord(7) - 1
+  phPxSlot = phCoord(8) - 1
+  phPxPhase0 = phCoord(5) - 1
+  IF phPxFam < 0 OR phPxFam > 2 OR phPxSeat < 0 OR phPxSeat > 7 OR phPxSlot < 0 OR phPxSlot > 15 OR phPxPhase0 < 0 OR phPxPhase0 > 3 THEN phPxForeign = 1
+END IF
+RETURN
+
+phFeedCh:
+' One payload character (phCh, an ASC code) for the scroll
+' whose projection was captured in phPxFam / phPxSeat /
+' phPxSlot / phPxPhase0. Separators (space, comma, tab, LF,
+' CR) close the current token; digits and a leading minus
+' build it; anything else marks it bad.
+IF phCh = 32 OR phCh = 44 OR phCh = 9 OR phCh = 10 OR phCh = 13 THEN
+  IF phTokOn = 1 THEN
+    GOSUB phFlushTok
+    phK = phK + 1
+    phTokV = 0
+    phTokSgn = 1
+    phTokOn = 0
+    phTokDig = 0
+    phTokBad = 0
+  END IF
+ELSE
+  phTokOn = 1
+  IF phCh >= 48 AND phCh <= 57 THEN
+    phTokV = phTokV * 10 + phCh - 48
+    phTokDig = phTokDig + 1
+  ELSE
+    IF phCh = 45 AND phTokDig = 0 AND phTokV = 0 THEN
+      phTokSgn = -1
+    ELSE
+      phTokBad = 1
+    END IF
+  END IF
+END IF
+RETURN
+
+phFlushTok:
+' Store the finished token at phase (phPxPhase0 + phK) of the
+' captured projection, or count it as a parse error (bad
+' token, no digits, or a phase overrun past phase 3).
+IF phTokBad = 1 OR phTokDig = 0 THEN
+  phParseErr = phParseErr + 1
+  RETURN
+END IF
+phFam = phPxFam
+phSeat = phPxSeat
+phSlot = phPxSlot
+phPhase = phPxPhase0 + phK
+IF phPhase > 3 THEN
+  phParseErr = phParseErr + 1
+  RETURN
+END IF
+phVal = phTokSgn * phTokV
+GOSUB phReplace
 RETURN
 
 phImplode:
@@ -374,6 +442,159 @@ WHILE phFam < 3
 WEND
 RETURN
 
+' ==== SECTION 1: CORE - INCREMENTAL PARSE (CHUNKED VOLUMES) ====
+' The walker below reads the chunked volume (phChunk$ /
+' phChunkN, filled by a phextwrap --chunked include) with the
+' same coordinate semantics as phParseVolume, a bounded slice
+' per call. State lives in globals (phPxChunk, phPxOff,
+' phPxState, phCoord, the tokenizer globals), so a parse
+' interrupted by the end of a decision resumes exactly where
+' it stopped at the next one. Costs: one string creation per
+' data-payload character fed (MID$), zero for foreign scrolls
+' (skipped by INSTR position) and zero for breaks.
+
+phParseReset:
+' Zero the walker: coordinate back to all 1s, cursor at the
+' first chunk, counters cleared.
+phScrolls = 0
+phForeign = 0
+phParseErr = 0
+phD = 0
+WHILE phD < 9
+  phCoord(phD) = 1
+  phD = phD + 1
+WEND
+phPxChunk = 0
+phPxOff = 0
+phPxState = 0
+phPxDone = 0
+phPxMore = 0
+phParsedChars = 0
+phTokV = 0
+phTokSgn = 1
+phTokOn = 0
+phTokDig = 0
+phTokBad = 0
+phK = 0
+RETURN
+
+phParseStep:
+' Parse until phParseBudget string creations are spent, the
+' volume is exhausted (phPxDone = 1), or 24 runs were handled
+' (a work bound, so a step is bounded even where foreign
+' scrolls cost no strings). Caller sets phParseBudget.
+phSpent = 0
+phPxRuns = 0
+WHILE phSpent < phParseBudget AND phPxDone = 0 AND phPxRuns < 24
+  IF phPxState = 0 THEN
+    GOSUB phPxScan
+  ELSE
+    GOSUB phPxFeed
+  END IF
+WEND
+RETURN
+
+phPxScan:
+' State 0 (between runs): advance past an exhausted chunk, a
+' break sitting at the cursor (coordinate advance, no string
+' cost), or position on the next run - foreign runs are
+' skipped by position, data runs capture their projection
+' and switch to state 1.
+IF phPxOff >= LEN(phChunk$(phPxChunk)) THEN
+  phPxChunk = phPxChunk + 1
+  phPxOff = 0
+  IF phPxChunk >= phChunkN THEN phPxDone = 1
+  RETURN
+END IF
+GOSUB phPxFindBrk
+IF phNext = phPxOff + 1 THEN
+  IF phCoord(phNextDim) + 1 < 1000 THEN phCoord(phNextDim) = phCoord(phNextDim) + 1
+  phD = phNextDim + 1
+  WHILE phD < 9
+    phCoord(phD) = 1
+    phD = phD + 1
+  WEND
+  phPxOff = phPxOff + 1
+  RETURN
+END IF
+phPxMore = 0
+IF phNext = 0 THEN phPxRunEnd = LEN(phChunk$(phPxChunk))
+IF phNext = 0 AND phPxChunk < phChunkN - 1 THEN phPxMore = 1
+IF phNext > 0 THEN phPxRunEnd = phNext - 1
+phPxRuns = phPxRuns + 1
+GOSUB phPxGateFromCoord
+IF phPxForeign = 1 THEN
+  WHILE phPxMore = 1
+    GOSUB phPxExtend
+  WEND
+  phForeign = phForeign + 1
+  phPxOff = phPxRunEnd
+  RETURN
+END IF
+phScrolls = phScrolls + 1
+phTokV = 0
+phTokSgn = 1
+phTokOn = 0
+phTokDig = 0
+phTokBad = 0
+phK = 0
+phPxState = 1
+RETURN
+
+phPxFeed:
+' State 1 (inside a data run): feed characters until the
+' step's budget is spent or the run ends; at the run's end,
+' flush the final token and return to state 0.
+WHILE phPxOff < phPxRunEnd AND phSpent < phParseBudget
+  phCh = ASC(MID$(phChunk$(phPxChunk), phPxOff + 1, 1))
+  phSpent = phSpent + 1
+  phParsedChars = phParsedChars + 1
+  GOSUB phFeedCh
+  phPxOff = phPxOff + 1
+WEND
+IF phPxOff >= phPxRunEnd THEN
+  IF phPxMore = 1 THEN
+    GOSUB phPxExtend
+  ELSE
+    phCh = 32
+    GOSUB phFeedCh
+    phPxState = 0
+  END IF
+END IF
+RETURN
+
+phPxFindBrk:
+' The earliest dimension break in the current chunk at or
+' after the cursor: phNext = its 1-based position (0 = none),
+' phNextDim = its dimension.
+phNext = 0
+phNextDim = -1
+phDim = 0
+WHILE phDim < 9
+  GOSUB phBreakFor
+  phP = INSTR(phPxOff + 1, phChunk$(phPxChunk), phBrk$)
+  IF phP > 0 AND (phNext = 0 OR phP < phNext) THEN
+    phNext = phP
+    phNextDim = phDim
+  END IF
+  phDim = phDim + 1
+WEND
+RETURN
+
+phPxExtend:
+' The current run reaches the end of a chunk and continues
+' into the next: advance the chunk and recompute the run's
+' end there, WITHOUT flushing - the tokenizer state carries
+' across the boundary, even mid-token.
+phPxChunk = phPxChunk + 1
+phPxOff = 0
+GOSUB phPxFindBrk
+phPxMore = 0
+IF phNext = 0 THEN phPxRunEnd = LEN(phChunk$(phPxChunk))
+IF phNext = 0 AND phPxChunk < phChunkN - 1 THEN phPxMore = 1
+IF phNext > 0 THEN phPxRunEnd = phNext - 1
+RETURN
+
 ' ==== SECTION 2: CARDS AND CASTERS BINDING ====
 ' Scroll map for this binding:
 '   ledger slots: 0 Hail of Arrows, 1 Post, 2 Overwork, 3 Bubble,
@@ -389,6 +610,13 @@ RETURN
 '     arrive as DATA: the policy's volume carries them as
 '     scrolls, phInit loads them, the code names no constants.
 '     Param slot 15 holds the data format version.
+'   baseline extension (generation 1, read by phReadBase):
+'     param slots (seat 0, phase 0): 4 focus weight wP (2),
+'     5 focus weight wC (1), 6 focus weight wH (2), 7 deck
+'     Hail copies (4 - the ledger threat bound), 9 overflow
+'     release count (7), 10 composition shift compRel (2),
+'     11 composition shift compFoc (1). Slot 8 documents the
+'     drift gamma (0.875, Q16.16); the law itself is code.
 ' The host policy reads the thetas each decision via phRead into
 ' relBand, focSwingB, focScoreB, burnBand.
 
@@ -399,15 +627,30 @@ IF phTurnN >= 10 THEN phPhase = 2
 RETURN
 
 phInit:
-' Load the volume (phLoadVolume, from the policy's data include)
-' and parse it into the store. Called from the host's setup
-' block - bassy reset() runs once before setup, so the loaded
-' store carries into the match - or lazily at the first decision
-' when the seat's setup never ran (classes-override rosters).
+' Load the volume (phLoadVolume, from the policy's data
+' include) and parse it into the store. Called from the host's
+' setup block - bassy reset() runs once before setup, so the
+' loaded store carries into the match - or lazily at the first
+' decision when the seat's setup never ran (classes-override
+' rosters). A chunked include (phChunked = 1) parses
+' incrementally: a first step here (budget 170 at setup, where
+' this invocation is its own generation; 48 when reached
+' lazily inside a decision), the rest inside phObserve.
 phReady = 1
 GOSUB phTextInit
 GOSUB phLoadVolume
-GOSUB phParseVolume
+IF phChunked = 1 THEN
+  phObsBudget = 149 - phChunkN
+  IF phObsBudget < 60 THEN phObsBudget = 60
+  IF phObsBudget > 140 THEN phObsBudget = 140
+  GOSUB phParseReset
+  phParseBudget = 48
+  IF selectingClass THEN phParseBudget = 170
+  GOSUB phParseStep
+ELSE
+  phObsBudget = 140
+  GOSUB phParseVolume
+END IF
 RETURN
 
 phRead:
@@ -428,14 +671,55 @@ GOSUB phSelect
 burnBand = (phVal + 32768) \ 65536
 RETURN
 
+phReadBase:
+' Baseline binding extension: the generation-1 PARAMS (seat 0,
+' phase 0, slots 4..11) the baseline policy consults beside
+' phRead's four thetas - the scored-focus weights (D4), the
+' ledger Hail bound, the overflow release count (D14), and the
+' composition shifts (D29). All Q16.16, rounded like phRead.
+phFam = 2
+phSeat = 0
+phPhase = 0
+phSlot = 4
+GOSUB phSelect
+focWP = (phVal + 32768) \ 65536
+phSlot = 5
+GOSUB phSelect
+focWC = (phVal + 32768) \ 65536
+phSlot = 6
+GOSUB phSelect
+focWH = (phVal + 32768) \ 65536
+phSlot = 7
+GOSUB phSelect
+hailCopies = (phVal + 32768) \ 65536
+phSlot = 9
+GOSUB phSelect
+releaseN = (phVal + 32768) \ 65536
+phSlot = 10
+GOSUB phSelect
+compRel = (phVal + 32768) \ 65536
+phSlot = 11
+GOSUB phSelect
+compFoc = (phVal + 32768) \ 65536
+RETURN
+
 phObserve:
-' Drain the event log since our last decision, oldest first,
-' inscribing observations at their coordinates, under the string
-' budget (140 string-returning host calls this decision - see
-' the string law in the header). Events past the budget are
-' skipped and counted in phSkipped: the mechanism degrades in
-' monster windows; it never dies there.
-phStrLeft = 140
+' First, a slice of the incremental parse (chunked volumes
+' only): up to 32 string creations, so the data cell completes
+' over the match's first decisions while the drain keeps its
+' own budget. Then drain the event log since our last
+' decision, oldest first, inscribing observations at their
+' coordinates, under the string budget (phObsBudget
+' string-returning host calls this decision - 140 by default,
+' lowered by phInit for chunked volumes; see the string law
+' in the header). Events past the budget are skipped and
+' counted in phSkipped: the mechanism degrades in monster
+' windows; it never dies there.
+IF phChunked = 1 AND phPxDone = 0 THEN
+  phParseBudget = 32
+  GOSUB phParseStep
+END IF
+phStrLeft = phObsBudget
 phEv = 0
 WHILE phEv < logCount()
   IF phStrLeft <= 0 THEN
